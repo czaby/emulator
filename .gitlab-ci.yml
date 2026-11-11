@@ -1,0 +1,143 @@
+# Showcase: terraform apply against AWS Emulator running as a GitLab CI
+# `services:` container.
+#
+# AWS does not publish a prebuilt emulator image, so the pipeline builds
+# the official Dockerfile first and pushes it to the GitLab container
+# registry. The apply job then starts that image as a service aliased
+# `aws-emulator`.
+#
+# GitLab `services:` cannot use the bind mount from the official Docker
+# guide (~/.aws/emulator), so this job cannot read the credentials and
+# ca.pem that the emulator writes inside the service container. The
+# documented workaround is `--auth off` (the emulator then accepts any
+# request and does not write a credentials file). Official docs say to
+# use that option only where nobody else can reach the emulator; a
+# per-job GitLab service network is not published to the internet.
+#
+# The emulator certificate is issued for 127.0.0.1. The job reaches the
+# service as https://aws-emulator:9297, so TLS hostname verification
+# cannot succeed. The apply job therefore sets insecure_skip_tls_verify.
+# Local runs should keep verification on and use AWS_CA_BUNDLE instead.
+#
+# Docs:
+#   https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-docker.html
+#   https://docs.aws.amazon.com/emulator/latest/userguide/point-sdk-to-emulator.html
+#   https://docs.aws.amazon.com/emulator/latest/userguide/cli-reference.html
+
+stages:
+  - build
+  - validate
+  - apply
+
+variables:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_VERSION: "1.13.4"
+  EMULATOR_IMAGE: "${CI_REGISTRY_IMAGE}/aws-emulator:${CI_COMMIT_SHA}"
+  # Prevent a runner's real AWS credentials from leaking into the job
+  # (environment variables take precedence over the emulator's files, and
+  # would also point tools at live AWS if AWS_ENDPOINT_URL were missing).
+  AWS_ACCESS_KEY_ID: ""
+  AWS_SECRET_ACCESS_KEY: ""
+  AWS_SESSION_TOKEN: ""
+  AWS_PROFILE: ""
+  AWS_EC2_METADATA_DISABLED: "true"
+  AWS_DISABLE_HOST_PREFIX_INJECTION: "true"
+  AWS_REGION: "us-east-1"
+  AWS_DEFAULT_REGION: "us-east-1"
+
+default:
+  interruptible: true
+
+# Build the official Dockerfile and push it so later jobs can start it
+# with `services:`. Needs a GitLab project with Container Registry.
+build:emulator-image:
+  stage: build
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+  before_script:
+    - docker info
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build -t "$EMULATOR_IMAGE" -t "${CI_REGISTRY_IMAGE}/aws-emulator:latest" .
+    - docker push "$EMULATOR_IMAGE"
+    - docker push "${CI_REGISTRY_IMAGE}/aws-emulator:latest"
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# terraform fmt / init / validate do not need a running emulator.
+validate:terraform:
+  stage: validate
+  image:
+    name: hashicorp/terraform:1.13.4
+    entrypoint: [""]
+  script:
+    - terraform -chdir=terraform version
+    - terraform -chdir=terraform fmt -check -recursive
+    - terraform -chdir=terraform init -backend=false -input=false
+    - terraform -chdir=terraform validate
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# Start AWS Emulator as a service and apply the demo stack against it.
+apply:emulator:
+  stage: apply
+  image:
+    name: hashicorp/terraform:1.13.4
+    entrypoint: [""]
+  services:
+    - name: ${CI_REGISTRY_IMAGE}/aws-emulator:${CI_COMMIT_SHA}
+      alias: aws-emulator
+      # ENTRYPOINT is ["aws-emulator", "-b", "0.0.0.0"]; these are extra args.
+      # --telemetry off: do not send anonymous usage data from CI.
+      # --auth off: see the file header (no shared volume for generated keys).
+      # --idle-timeout: stop a forgotten emulator after 1 hour of no API calls.
+      command: ["--telemetry", "off", "--auth", "off", "--idle-timeout", "3600"]
+  variables:
+    AWS_ENDPOINT_URL: "https://aws-emulator:9297"
+    AWS_REGION: "us-east-1"
+    AWS_DEFAULT_REGION: "us-east-1"
+    AWS_EC2_METADATA_DISABLED: "true"
+    AWS_DISABLE_HOST_PREFIX_INJECTION: "true"
+    # Placeholder keys only. With --auth off the emulator does not check
+    # signatures, but the Terraform AWS provider still requires a key pair.
+    # These are not the keys the emulator would generate (those start with
+    # EMULATOR and are unique per run).
+    AWS_ACCESS_KEY_ID: "EMULATORPLACEHOLDER"
+    AWS_SECRET_ACCESS_KEY: "emulator-placeholder-secret-not-used"
+    TF_VAR_aws_endpoint: "https://aws-emulator:9297"
+    TF_VAR_insecure_skip_tls_verify: "true"
+    INSECURE: "1"
+  needs:
+    - build:emulator-image
+  before_script:
+    # The official hashicorp/terraform image is Alpine-based and has a
+    # shell; curl is needed for the health check.
+    - apk add --no-cache curl
+    - chmod +x ci/wait-for-emulator.sh
+    - ci/wait-for-emulator.sh
+  script:
+    - terraform -chdir=terraform init -input=false
+    - terraform -chdir=terraform validate
+    - terraform -chdir=terraform plan -input=false -out=tfplan
+    - terraform -chdir=terraform apply -input=false -auto-approve tfplan
+    - terraform -chdir=terraform output
+    # The emulator discards in-memory state when the service container
+    # stops, so destroy runs in this same job (a later job would see a
+    # new, empty emulator).
+    - terraform -chdir=terraform destroy -input=false -auto-approve
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - terraform/tfplan
+      - terraform/terraform.tfstate
+      - terraform/terraform.tfstate.backup
+  rules:
+    - if: $CI_COMMIT_BRANCH
