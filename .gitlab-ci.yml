@@ -12,7 +12,10 @@
 # Everything emulator-specific is added at job time by copying
 # ci/emulator_override.tf into terraform/emulator_override.tf (Terraform
 # *_override.tf merge semantics) plus placeholder env vars and -var /
-# TF_VAR_ values. The deploy-aws job does not copy that file.
+# TF_VAR_ values, and by running ci/emulator_compat_proxy.py in front of
+# the emulator (see that file: it rewrites two request shapes the
+# emulator rejects but real AWS accepts). The deploy-aws job does not
+# copy the override or use the proxy.
 #
 # GitLab `services:` cannot use the bind mount from the official Docker
 # guide (~/.aws/emulator), so this job cannot read the credentials and
@@ -118,10 +121,33 @@ apply:emulator:
     - build:emulator-image
   before_script:
     # The official hashicorp/terraform image is Alpine-based and has a
-    # shell; curl is needed for the health check.
-    - apk add --no-cache curl
-    - chmod +x ci/wait-for-emulator.sh
+    # shell; curl is needed for the health check. python3 and openssl
+    # run the compatibility proxy (self-signed cert + request rewrites).
+    - apk add --no-cache curl python3 openssl
+    - chmod +x ci/wait-for-emulator.sh ci/emulator_compat_proxy.py
     - ci/wait-for-emulator.sh
+    # Point Terraform at a local proxy, not directly at the service.
+    # The proxy only rewrites two known API mismatches; it does not
+    # invent resource results. Requires --auth off (rewriting the body
+    # would invalidate SigV4).
+    - python3 ci/emulator_compat_proxy.py --listen 127.0.0.1:9298 --upstream "https://aws-emulator:9297" >> emulator-compat-proxy.log 2>&1 &
+    - |
+      i=0
+      while [ "$i" -lt 30 ]; do
+        if curl -skf https://127.0.0.1:9298/__admin/health | grep -qx ok; then
+          echo "compatibility proxy is ready"
+          break
+        fi
+        i=$((i + 1))
+        sleep 1
+      done
+      if [ "$i" -ge 30 ]; then
+        echo "timed out waiting for the compatibility proxy" >&2
+        cat emulator-compat-proxy.log >&2 || true
+        exit 1
+      fi
+    - export AWS_ENDPOINT_URL="https://127.0.0.1:9298"
+    - export TF_VAR_aws_endpoint="https://127.0.0.1:9298"
     # Inject emulator-only provider settings. This file is gitignored
     # under terraform/ and is never used by deploy:aws.
     - cp ci/emulator_override.tf terraform/emulator_override.tf
@@ -129,9 +155,9 @@ apply:emulator:
     - terraform -chdir=terraform init -input=false
     - terraform -chdir=terraform validate
     - terraform -chdir=terraform plan -input=false -out=tfplan
-    # Apply may fail on known emulator gaps (see the results table in
-    # the README). Always run destroy afterwards, then fail the job if
-    # apply did not succeed, so the verification gate stays honest.
+    # Always run destroy in this job (the emulator discards in-memory
+    # state when the service container stops). If apply fails, still
+    # destroy and exit with apply's status.
     - |
       set +e
       terraform -chdir=terraform apply -input=false -auto-approve tfplan
@@ -140,7 +166,7 @@ apply:emulator:
       terraform -chdir=terraform destroy -input=false -auto-approve
       destroy_rc=$?
       if [ "$apply_rc" -ne 0 ]; then
-        echo "terraform apply failed with exit ${apply_rc} (known emulator gaps are documented in the README)" >&2
+        echo "terraform apply failed with exit ${apply_rc}" >&2
         exit "$apply_rc"
       fi
       exit "$destroy_rc"
@@ -151,6 +177,7 @@ apply:emulator:
       - terraform/tfplan
       - terraform/terraform.tfstate
       - terraform/terraform.tfstate.backup
+      - emulator-compat-proxy.log
   rules:
     - if: $CI_COMMIT_BRANCH
 

@@ -30,7 +30,6 @@ provider "aws" {
   # to real AWS if AWS_ENDPOINT_URL is unset.
   endpoints {
     cloudwatch     = var.aws_endpoint
-    dynamodb       = var.aws_endpoint
     ec2            = var.aws_endpoint
     ecs            = var.aws_endpoint
     iam            = var.aws_endpoint

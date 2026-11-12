@@ -3,16 +3,6 @@ output "bucket_id" {
   value       = aws_s3_bucket.demo.id
 }
 
-output "table_name" {
-  description = "Name of the DynamoDB table."
-  value       = aws_dynamodb_table.demo.name
-}
-
-output "table_arn" {
-  description = "ARN of the DynamoDB table."
-  value       = aws_dynamodb_table.demo.arn
-}
-
 output "vpc_id" {
   description = "ID of the demo VPC."
   value       = aws_vpc.demo.id

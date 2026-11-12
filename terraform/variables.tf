@@ -33,11 +33,6 @@ variable "bucket_name" {
   default     = "emulator-demo-bucket"
 }
 
-variable "table_name" {
-  type        = string
-  description = "DynamoDB table name."
-  default     = "emulator-demo-table"
-}
 
 variable "vpc_cidr" {
   type        = string

@@ -18,3 +18,7 @@ terraform.rc
 
 # Local emulator files (generated at runtime; never commit)
 .aws-emulator/
+
+# Python
+__pycache__/
+*.pyc
