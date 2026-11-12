@@ -6,9 +6,13 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.100"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
   }
 
-  # Local state is enough here: the emulator keeps resources in memory and
-  # discards them when it stops, so there is no remote backend to talk to.
+  # Local state keeps this demo self-contained. A production deploy of the
+  # same code against AWS would typically switch this to a remote backend.
   backend "local" {}
 }
